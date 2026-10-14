@@ -1,12 +1,28 @@
 #!/bin/zsh
 # Free a OneDrive folder whose files are stuck at Content Policy 3 ("keep downloaded").
-# Usage: zsh fix_folder.sh "<folder inside ~/Library/CloudStorage/OneDrive-*>"
+# Usage: zsh fix_folder.sh "<folder inside ~/Library/CloudStorage/OneDrive-Personal>"
 # Must run in a terminal that has Full Disk Access (macOS protects the FileProvider database).
+#
+# Flow: stop OneDrive and back up its databases -> macOS policy 3 -> 1 for every file in the
+# folder (cloud-only too) -> restart fileproviderd -> evict downloaded files -> clear OneDrive's
+# "freed" marks (pin state 2, flag bit 8) -> start OneDrive -> report what came back.
 set -e
 DIR="${1:?usage: fix_folder.sh <OneDrive folder>}"
+DIR="${DIR:A}"
 HERE="${0:A:h}"
 PROVEN_ONEDRIVE="26.168.0830"
 PROVEN_MACOS="25G83"
+SYNC_ENGINE_DB="$HOME/Library/Containers/com.microsoft.OneDrive-mac/Data/Library/Application Support/OneDrive/settings/Personal/SyncEngineDatabase.db"
+ONEDRIVE_DB="$HOME/Library/Group Containers/UBF8T346G9.OneDriveSyncClientSuite/OneDrive.noindex/OneDrive.dat"
+BACKUP_ROOT="$HOME/onedrive-free-up-fix-backups"
+BACKUPS_TO_KEEP=5
+STAMP=$(date +%Y%m%d-%H%M%S)
+IDS_FILE="$HOME/onedrive-free-up-fix-ids-$STAMP.txt"
+
+case "$DIR" in
+  "$HOME/Library/CloudStorage/OneDrive-Personal/"*) ;;
+  *) echo "Only verified for folders inside ~/Library/CloudStorage/OneDrive-Personal"; exit 1 ;;
+esac
 
 OD_VER=$(defaults read /Applications/OneDrive.app/Contents/Info.plist CFBundleShortVersionString)
 OS_BUILD=$(sw_vers -buildVersion)
@@ -19,43 +35,86 @@ fi
 
 echo "== before"; du -sh "$DIR"
 
-echo "== collecting downloaded files with Content Policy 3"
-ids=(); files=()
+echo "== collecting item IDs (every file, downloaded or cloud-only; .DS_Store skipped)"
+ids=(); downloaded=()
 while IFS= read -r -d '' f; do
-  out=$(fileproviderctl evaluate "$f" 2>/dev/null)
-  if print -r -- "$out" | grep -q '^Content Policy: 3$'; then
-    ids+=$(print -r -- "$out" | awk -F' = ' '/itemIdentifier =/ {gsub(/[;"]/, "", $2); print $2; exit}')
-    files+=("$f")
-  fi
-done < <(find "$DIR" -type f ! -flags dataless -print0)
-echo "found ${#ids} stuck files"
-(( ${#ids} )) || { echo "nothing to fix"; exit 0; }
-
-# Locate fileproviderd's database for this OneDrive domain: the one that knows the first item.
-FPDB=""
-for db in "$HOME/Library/Application Support/FileProvider"/*/database/db; do
-  n=$(sqlite3 "$db" "SELECT count(*) FROM FP_snapshot WHERE id = CAST('${ids[1]}' AS BLOB);" 2>/dev/null || echo 0)
-  [[ "$n" == 1 ]] && { FPDB="$db"; break; }
-done
-[[ -n "$FPDB" ]] || { echo "could not find the FileProvider database (Full Disk Access?)"; exit 1; }
-echo "== database: $FPDB"
-IDS_FILE="$HOME/onedrive-free-up-fix-ids-$(date +%Y%m%d-%H%M%S).txt"
+  id=$(fileproviderctl evaluate "$f" 2>/dev/null | awk -F' = ' '/itemIdentifier =/ {gsub(/[;"]/, "", $2); print $2; exit}')
+  if [[ -n "$id" ]]; then ids+=("$id"); fi
+  if [[ -z "$(find "$f" -flags dataless)" ]]; then downloaded+=("$f"); fi
+done < <(find "$DIR" -type f ! -name .DS_Store -print0)
+echo "files: ${#ids}   downloaded: ${#downloaded}"
+(( ${#downloaded} )) || { echo "nothing to free"; exit 0; }
 print -l -- $ids > "$IDS_FILE"
-echo "== ids saved for rollback: $IDS_FILE"
+echo "== IDs saved for rollback: $IDS_FILE"
+
+stop_onedrive() {
+  osascript -e 'quit app "OneDrive"' >/dev/null 2>&1 || true
+  for i in {1..15}; do pgrep -x OneDrive >/dev/null || break; sleep 1; done
+  pkill -f "OneDrive File Provider" 2>/dev/null || true
+  sleep 2
+  ! pgrep -f "/Applications/OneDrive.app/" >/dev/null
+}
+ONEDRIVE_STARTED=0
+start_onedrive() { open -a OneDrive; ONEDRIVE_STARTED=1; }
+trap '(( ONEDRIVE_STARTED )) || start_onedrive' EXIT  # always bring OneDrive back
+
+echo "== stopping OneDrive"
+stop_onedrive || { echo "couldn't stop OneDrive, nothing changed"; exit 1; }
+
+echo "== backing up OneDrive's databases"
+BACKUP="$BACKUP_ROOT/$STAMP"
+mkdir -p "$BACKUP"
+cp -p "$SYNC_ENGINE_DB"* "$ONEDRIVE_DB"* "$BACKUP/"
+old=("$BACKUP_ROOT"/*(/On))  # newest first
+if (( ${#old} > BACKUPS_TO_KEEP )); then rm -rf -- "${(@)old[BACKUPS_TO_KEEP+1,-1]}"; fi
+echo "backup: $BACKUP"
 
 echo "== macOS records: policy 3 -> 1"
-python3 -I "$HERE/fp_set_policy.py" "$FPDB" $ids
+out=$(python3 -I "$HERE/fp_set_policy.py" auto $ids)
+print -r -- "$out"
+FPDB=$(print -r -- "$out" | sed -n 's/^database: //p')
+changed=$(print -r -- "$out" | sed -n 's/^updated \([0-9]*\) of.*/\1/p')
+if (( ${changed:-0} > 0 )); then
+  echo "== restarting fileproviderd so it reloads its records, then waiting 30s"
+  killall fileproviderd || true; sleep 30
+fi
 
-echo "== restarting fileproviderd so it reloads its records"
-killall fileproviderd || true; sleep 10
-fileproviderctl evaluate "${files[1]}" | grep -E '^Content Policy:'
+echo "== evicting downloaded files with the macOS call (not OneDrive's menu)"
+EVICT_LOG="$IDS_FILE.evict.log"
+print -N -- $downloaded | xargs -0 swift "$HERE/evict.swift" > "$EVICT_LOG" || true
+echo "evicted: $(grep -c '^evicted:' "$EVICT_LOG")   failed: $(grep -c '^FAILED' "$EVICT_LOG")"
 
-echo "== evicting with the macOS call (not OneDrive's menu)"
-print -N -- $files | xargs -0 swift "$HERE/evict.swift" > "$IDS_FILE.evict.log" || true
-echo "evicted: $(grep -c '^evicted:' "$IDS_FILE.evict.log")   failed: $(grep -c '^FAILED' "$IDS_FILE.evict.log")"
-grep '^FAILED' "$IDS_FILE.evict.log" | head -5 || true
+echo "== OneDrive records: clear 'freed' marks (pin state 2 -> 0, flag bit 8 off)"
+LIST=${(j:,:)${(M)ids:#<->}}  # numeric IDs only
+if [[ -z "$LIST" ]]; then
+  echo "no numeric item IDs, OneDrive records left alone"
+elif stop_onedrive; then
+  sqlite3 "$SYNC_ENGINE_DB" <<EOF
+.bail on
+ATTACH '$ONEDRIVE_DB' AS fp;
+BEGIN IMMEDIATE;
+UPDATE od_ClientFile_Records SET lastKnownPinState = 0
+ WHERE lastKnownPinState = 2 AND itemIndex IN (SELECT fsid FROM fp.dbfs_files WHERE itemid IN ($LIST));
+SELECT 'pin state 2 -> 0: ' || changes();
+UPDATE fp.dbfs_files SET state_flags = state_flags & ~8
+ WHERE itemid IN ($LIST) AND filetype = 0 AND (state_flags & 8) != 0 AND (state_flags & 32) != 0;
+SELECT 'mark cleared: ' || changes();
+COMMIT;
+PRAGMA main.integrity_check;
+PRAGMA fp.integrity_check;
+EOF
+else
+  echo "!! OneDrive's helper is still running; its records were NOT changed"
+fi
 
-echo "== waiting 60s to catch re-downloads"; sleep 60
+echo "== starting OneDrive, waiting 60s to catch anything coming back"
+start_onedrive; sleep 60
+
 echo "== after"; du -sh "$DIR"
-echo "cloud-only: $(find "$DIR" -type f -flags dataless | wc -l)   on disk: $(find "$DIR" -type f ! -flags dataless | wc -l)"
+echo "cloud-only: $(find "$DIR" -type f ! -name .DS_Store -flags dataless | wc -l)   on disk: $(find "$DIR" -type f ! -name .DS_Store ! -flags dataless | wc -l)"
+if [[ -n "$FPDB" && -n "$LIST" ]]; then
+  blobs=(); for i in ${(M)ids:#<->}; do blobs+=("CAST('$i' AS BLOB)"); done
+  BLOBS=${(j:,:)blobs}
+  echo "still at policy 3: $(sqlite3 -readonly "$FPDB" "SELECT count(*) FROM FP_snapshot WHERE decoration_content_policy = 3 AND id IN ($BLOBS);")"
+fi
 df -h /System/Volumes/Data | tail -1
