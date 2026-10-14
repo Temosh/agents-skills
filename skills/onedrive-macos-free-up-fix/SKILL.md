@@ -47,6 +47,11 @@ Each OneDrive file has records in three places:
 | OneDrive `OneDrive.dat` (`~/Library/Group Containers/UBF8T346G9.OneDriveSyncClientSuite/OneDrive.noindex/`), table `dbfs_files` | `capabilities` | **-1** (default) | **47** |
 | OneDrive `SyncEngineDatabase.db` (`~/Library/Containers/com.microsoft.OneDrive-mac/Data/Library/Application Support/OneDrive/settings/Personal/`), table `od_ClientFile_Records` | `lastKnownPinState` | empty or 0 | 2 after a Free Up; 1 while pinned |
 
+**Field reference:** `references/fields.md` has every bit and value seen, with masks, Apple's
+enum names and confidence levels. Read it when decoding raw values from the databases or the
+system log. Flags are named here as **mask (bit position)**, e.g. `state_flags & 8` = mask 8,
+bit 3; always test single masks, never compare whole values.
+
 **What happens:**
 
 1. "Always Keep on This Device" sets pin state 1 and `capabilities` **47**. Read as macOS
@@ -81,7 +86,7 @@ followed by `fetch-content(<id>) why:materialization|itemChangedRemotely|backgro
 
 - **Pin state:** 229 files at pin state 0 still got `keepDownloaded` while caps was 47.
   OneDrive also resets pin state to empty by itself after restarts.
-- **The "freed" flag** (`state_flags` bit 8: 35 normal, 43 marked).
+- **The "freed" flag** (`state_flags & 8`, bit 3: 35 normal, 43 marked).
 - `in_materialized_set`, which doesn't track what's on disk.
 - **Download history:** it correlates, because only downloaded files were ever pinned,
   but it isn't the cause.
@@ -102,9 +107,9 @@ If OneDrive is stopped, its databases may have no `-shm` file and `mode=ro` fail
 `immutable=1` instead.
 
 Intentionally pinned files are also caps 47, and they should be left alone. Recognise them
-by the **pinned bit in `dbfs_files.state_flags`** (`& 4`, e.g. 37 or 101), not by pin state.
+by the **pinned flag (mask 4, bit 2) in `dbfs_files.state_flags`** (`& 4`, e.g. 37 or 101), not by pin state.
 Files pinned through a parent folder keep an **empty** pin state but still have the bit.
-Leftovers have flags 35 (no pinned bit) and caps 47.
+Leftovers have flags 35 (`& 4` clear) and caps 47.
 
 On the macOS side, from a Full Disk Access terminal:
 
@@ -140,11 +145,11 @@ healthy folder you should see only `cp:lazy` and no `fetch-content`.
   they download. Fix the macOS policy before any restart.
 - **The policy drops back to 1 after a file finishes downloading,** so by the time you look
   the evidence may be gone. Use the system log.
-- **While OneDrive is running, it usually marks freed files** (pin state 2, bit 8). With
+- **While OneDrive is running, it usually marks freed files** (pin state 2, mask 8 (bit 3)). With
   OneDrive stopped during eviction, no marks were created. Marks are harmless once caps
   is -1: they're OneDrive's normal "freed" state.
 - **"Sync pending" arrows after a repair.** Files that were pinned and then unpinned can
-  lose OneDrive's `state_flags` bit 32 (3 instead of 35). Finder shows round arrows even
+  lose OneDrive's `state_flags` mask 32 (bit 5) (3 instead of 35). Finder shows round arrows even
   after a repair. OneDrive's own Free Up Space on the folder restores it; it's harmless.
 - **Stopping OneDrive while files are downloading may fail.** `fileproviderd` relaunches
   the `OneDrive File Provider` helper to finish the queued downloads. Fixing the macOS
@@ -163,7 +168,7 @@ healthy folder you should see only `cp:lazy` and no `fetch-content`.
 - `fileproviderctl` has no `evict` command, and `fileproviderctl repair` doesn't help.
 - Don't edit OneDrive's databases while OneDrive is running. Quit OneDrive, stop the
   `OneDrive File Provider` helper and back up both databases first.
-- Don't touch intentionally pinned files: pinned bit set in `state_flags` (`& 4`), whether
+- Don't touch intentionally pinned files: pinned flag (mask 4, bit 2) set in `state_flags` (`& 4`), whether
   pin state is 1 or empty (folder-level pins). They are caps 47 and policy 3 by design.
 
 ## Working with the user
@@ -203,12 +208,12 @@ Run it in a terminal with Full Disk Access. It works only for
 4. Evicts the downloaded files with `scripts/evict.swift`. With nothing downloaded, it
    repairs records only.
 5. Repairs OneDrive's records for those files: **capabilities 47 → -1** (the fix), pin
-   state 2/empty → 0, bit 8 off. Then it runs integrity checks. It only does this when the
+   state 2/empty → 0, mask 8 (bit 3) off. Then it runs integrity checks. It only does this when the
    helper is really stopped.
 6. Starts OneDrive (always, even if a step fails), waits 10 s, and records the `final`
    state.
 
-**Intentionally pinned files are skipped.** These are files with the pinned bit in
+**Intentionally pinned files are skipped.** These are files with the pinned flag (mask 4, bit 2) in
 `state_flags`, set directly or inherited from a pinned folder. They're listed as `skipped:`
 in the log, and nothing about them changes. Freeing them without a real unpin would leave
 OneDrive believing they're pinned, and it would push them back. To free a pinned folder,
@@ -250,7 +255,7 @@ system log should show `cp:lazy` and no `fetch-content`.
 
 ### Possible improvements (not tested yet)
 
-**Only repair what causes the problem.** `fix_folder.sh` also treats OneDrive's "freed" mark (`state_flags` bit 8) and an empty or 2
+**Only repair what causes the problem.** `fix_folder.sh` also treats OneDrive's "freed" mark (`state_flags` mask 8 (bit 3)) and an empty or 2
 pin state as needing repair. It clears the marks and sets pin state to 0. These aren't the
 cause. With `capabilities` -1, OneDrive's own Free Up Space sent `lazy` whatever the pin state
 or mark was. The mark is OneDrive's normal "freed" bookkeeping: after OneDrive's own Free Up
@@ -268,16 +273,16 @@ Not implemented or tested yet; propose it to the user before changing the script
 
 **Treat OneDrive's "sync pending" state as not clean.**
 
-- **What was seen:** after a pin and unpin, files can lose bit 32 in OneDrive's
+- **What was seen:** after a pin and unpin, files can lose mask 32 (bit 5) in OneDrive's
   `state_flags`, ending at **3** instead of 35. Finder then shows OneDrive's round "sync
-  pending" arrows. Every other file had bit 32 (35, 37, 43, 101), so it's very likely
+  pending" arrows. Every other file had mask 32 (bit 5) (35, 37, 43, 101), so it's very likely
   OneDrive's "in sync" flag.
-- **Why the script misses it:** `fix_folder.sh` doesn't touch or check bit 32. Those files
+- **Why the script misses it:** `fix_folder.sh` doesn't touch or check mask 32 (bit 5). Those files
   end the run freed and correct (policy 1, capabilities -1), yet still show the arrows, and
   the final check calls them clean.
 - **What clears it:** OneDrive's own Free Up Space on the folder restored the bit (3 → 43)
   within about a minute. It sent `lazy` and downloaded nothing.
-- **The idea:** report files without bit 32 in the final check (e.g. `problem: sync pending`).
+- **The idea:** report files without mask 32 (bit 5) in the final check (e.g. `problem: sync pending`).
   Don't set the bit ourselves, because OneDrive restores it.
 - Not implemented or tested yet.
 
