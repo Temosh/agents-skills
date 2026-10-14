@@ -245,6 +245,24 @@ same SQL as the script.
 Finally, verify with the reproduction: OneDrive's own Free Up Space on the file, then the
 system log should show `cp:lazy` and no `fetch-content`.
 
+### Possible improvement (not tested yet)
+
+`fix_folder.sh` also treats OneDrive's "freed" mark (`state_flags` bit 8) and an empty or 2
+pin state as needing repair. It clears the marks and sets pin state to 0. These aren't the
+cause. With `capabilities` -1, OneDrive's own Free Up Space sent `lazy` whatever the pin state
+or mark was. The mark is OneDrive's normal "freed" bookkeeping: after OneDrive's own Free Up
+Space on a repaired folder, every file gets it again, and a rerun "repairs" all of them for
+nothing.
+
+The idea:
+
+- count only macOS policy 3 and `capabilities` 47 as needing repair (plus downloaded files to
+  free);
+- leave pin state and the mark alone;
+- keep logging them.
+
+Not implemented or tested yet; propose it to the user before changing the script.
+
 ## Time bombs: find and defuse
 
 Find cloud-only files at policy 3 anywhere (read-only, Full Disk Access terminal):
