@@ -143,6 +143,9 @@ healthy folder you should see only `cp:lazy` and no `fetch-content`.
 - **While OneDrive is running, it usually marks freed files** (pin state 2, bit 8). With
   OneDrive stopped during eviction, no marks were created. Marks are harmless once caps
   is -1: they're OneDrive's normal "freed" state.
+- **"Sync pending" arrows after a repair.** Files that were pinned and then unpinned can
+  lose OneDrive's `state_flags` bit 32 (3 instead of 35). Finder shows round arrows even
+  after a repair. OneDrive's own Free Up Space on the folder restores it; it's harmless.
 - **Stopping OneDrive while files are downloading may fail.** `fileproviderd` relaunches
   the `OneDrive File Provider` helper to finish the queued downloads. Fixing the macOS
   policy first, then restarting `fileproviderd`, cancels the queue.
@@ -245,9 +248,9 @@ same SQL as the script.
 Finally, verify with the reproduction: OneDrive's own Free Up Space on the file, then the
 system log should show `cp:lazy` and no `fetch-content`.
 
-### Possible improvement (not tested yet)
+### Possible improvements (not tested yet)
 
-`fix_folder.sh` also treats OneDrive's "freed" mark (`state_flags` bit 8) and an empty or 2
+**Only repair what causes the problem.** `fix_folder.sh` also treats OneDrive's "freed" mark (`state_flags` bit 8) and an empty or 2
 pin state as needing repair. It clears the marks and sets pin state to 0. These aren't the
 cause. With `capabilities` -1, OneDrive's own Free Up Space sent `lazy` whatever the pin state
 or mark was. The mark is OneDrive's normal "freed" bookkeeping: after OneDrive's own Free Up
@@ -262,6 +265,21 @@ The idea:
 - keep logging them.
 
 Not implemented or tested yet; propose it to the user before changing the script.
+
+**Treat OneDrive's "sync pending" state as not clean.**
+
+- **What was seen:** after a pin and unpin, files can lose bit 32 in OneDrive's
+  `state_flags`, ending at **3** instead of 35. Finder then shows OneDrive's round "sync
+  pending" arrows. Every other file had bit 32 (35, 37, 43, 101), so it's very likely
+  OneDrive's "in sync" flag.
+- **Why the script misses it:** `fix_folder.sh` doesn't touch or check bit 32. Those files
+  end the run freed and correct (policy 1, capabilities -1), yet still show the arrows, and
+  the final check calls them clean.
+- **What clears it:** OneDrive's own Free Up Space on the folder restored the bit (3 → 43)
+  within about a minute. It sent `lazy` and downloaded nothing.
+- **The idea:** report files without bit 32 in the final check (e.g. `problem: sync pending`).
+  Don't set the bit ourselves, because OneDrive restores it.
+- Not implemented or tested yet.
 
 ## Time bombs: find and defuse
 
